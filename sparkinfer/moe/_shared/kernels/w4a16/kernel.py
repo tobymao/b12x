@@ -6603,13 +6603,44 @@ def _query_w4a16_kernel_resources(compiled: object) -> tuple[str, int, int] | No
         raise RuntimeError(
             f"cudaLibraryGetKernel failed for {symbols[0]}: {kernel_status}"
         )
-    attributes_status, attributes = cuda_runtime.cudaFuncGetAttributes(kernel_handle)
-    if attributes_status != success:
-        raise RuntimeError(
-            f"cudaFuncGetAttributes failed for {symbols[0]}: {attributes_status}"
+    try:
+        attributes_status, attributes = cuda_runtime.cudaFuncGetAttributes(
+            kernel_handle
         )
-    registers_per_thread = int(getattr(attributes, "numRegs", -1))
-    local_memory_bytes = int(getattr(attributes, "localSizeBytes", -1))
+        if attributes_status != success:
+            raise RuntimeError(
+                f"cudaFuncGetAttributes failed for {symbols[0]}: {attributes_status}"
+            )
+        registers_per_thread = int(getattr(attributes, "numRegs", -1))
+        local_memory_bytes = int(getattr(attributes, "localSizeBytes", -1))
+    except TypeError:
+        # cuda-bindings >= 13 no longer accepts cudaKernel_t in
+        # cudaFuncGetAttributes; query through the driver kernel-attribute API
+        # (cudaKernel_t and CUkernel are interchangeable handles).
+        cukernel = cuda.CUkernel(int(kernel_handle))
+        device_ordinal = int(torch.cuda.current_device())
+        driver_success = cuda.CUresult(0)
+        registers_per_thread = -1
+        local_memory_bytes = -1
+        for attribute, name in (
+            (cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_NUM_REGS, "num_regs"),
+            (
+                cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES,
+                "local_size_bytes",
+            ),
+        ):
+            attr_status, attr_value = cuda.cuKernelGetAttribute(
+                attribute, cukernel, device_ordinal
+            )
+            if attr_status != driver_success:
+                raise RuntimeError(
+                    f"cuKernelGetAttribute({name}) failed for {symbols[0]}: "
+                    f"{attr_status}"
+                )
+            if name == "num_regs":
+                registers_per_thread = int(attr_value)
+            else:
+                local_memory_bytes = int(attr_value)
     if registers_per_thread < 0 or local_memory_bytes < 0:
         raise RuntimeError(f"incomplete CUDA function attributes for {symbols[0]}")
     return symbols[0], registers_per_thread, local_memory_bytes
